@@ -1,16 +1,16 @@
-name: Publish Learning Plan
+name: Publish Learning Plans
 
 on:
   push:
     paths:
-      - 'calendar/plan.json'
+      - 'calendar/plans.json'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-learning-plan-${{ github.ref }}
+  group: publish-learning-plans-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -20,21 +20,29 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate plan payload
+      - name: Validate plan payloads
         run: |
           set -euo pipefail
           jq -e '
-            .title and
-            (.kind == "all_day") and
-            (.start | type == "string") and
-            (.end | type == "string") and
-            (.public == false) and
-            (.done == false) and
-            (.reminder == null) and
-            (.rule == null)
-          ' calendar/plan.json >/dev/null
+            type == "array" and
+            length > 0 and
+            ((map(.title) | unique | length) == length) and
+            ((map(.start) | unique | length) == 1) and
+            ((map(.end) | unique | length) == 1) and
+            all(.[];
+              (.title | type == "string" and length > 0) and
+              (.notes | type == "string") and
+              (.kind == "all_day") and
+              (.start | type == "string") and
+              (.end | type == "string") and
+              (.public == false) and
+              (.done == false) and
+              (.reminder == null) and
+              (.rule == null)
+            )
+          ' calendar/plans.json >/dev/null
 
-      - name: Publish to plan.crasnec.com
+      - name: Replace plans on plan.crasnec.com
         env:
           PLAN_AGENT_TOKEN: ${{ secrets.PLAN_AGENT_TOKEN }}
         run: |
@@ -45,23 +53,80 @@ jobs:
             exit 1
           fi
 
-          plan_date="$(jq -r '.start' calendar/plan.json)"
-          idempotency_key="auto-learning:${plan_date}:${GITHUB_SHA}"
+          plan_date="$(jq -r '.[0].start' calendar/plans.json)"
+          next_date="$(jq -r '.[0].end' calendar/plans.json)"
+          api='https://plan.crasnec.com/api/agent/v1'
 
-          http_code="$(curl --silent --show-error \
-            --output response.json \
+          # Remove prior plans managed by this repository for the same date.
+          list_code="$(curl --silent --show-error \
+            --output existing.json \
             --write-out '%{http_code}' \
-            --request POST \
-            'https://plan.crasnec.com/api/agent/v1/items' \
-            --header "Authorization: Bearer ${PLAN_AGENT_TOKEN}" \
-            --header 'Content-Type: application/json' \
-            --header "Idempotency-Key: ${idempotency_key}" \
-            --data-binary @calendar/plan.json)"
+            --request GET \
+            "${api}/items?from=${plan_date}&to=${next_date}&limit=500&offset=0" \
+            --header "Authorization: Bearer ${PLAN_AGENT_TOKEN}")"
 
-          cat response.json
-          echo
-
-          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
-            echo "Calendar API returned HTTP ${http_code}." >&2
+          if [ "$list_code" -lt 200 ] || [ "$list_code" -ge 300 ]; then
+            cat existing.json || true
+            echo "Calendar list API returned HTTP ${list_code}." >&2
             exit 1
           fi
+
+          jq -c --arg date "$plan_date" '
+            .items[] |
+            select(
+              (.title == ("학습 플랜 — " + $date)) or
+              ((.notes // "") | startswith("[auto-learning]"))
+            )
+          ' existing.json | while IFS= read -r occurrence; do
+            item_id="$(jq -r '.itemId // .id' <<<"$occurrence")"
+            occurrence_key="$(jq -r '.key' <<<"$occurrence")"
+            version="$(jq -r '.version' <<<"$occurrence")"
+            delete_key="auto-learning:delete:${plan_date}:${item_id}:${GITHUB_SHA}"
+
+            jq -nc \
+              --arg key "$occurrence_key" \
+              --argjson version "$version" \
+              '{key:$key,version:$version,scope:"all"}' > delete.json
+
+            delete_code="$(curl --silent --show-error \
+              --output delete-response.json \
+              --write-out '%{http_code}' \
+              --request DELETE \
+              "${api}/items/${item_id}" \
+              --header "Authorization: Bearer ${PLAN_AGENT_TOKEN}" \
+              --header 'Content-Type: application/json' \
+              --header "Idempotency-Key: ${delete_key}" \
+              --data-binary @delete.json)"
+
+            cat delete-response.json
+            echo
+            if [ "$delete_code" -lt 200 ] || [ "$delete_code" -ge 300 ]; then
+              echo "Calendar delete API returned HTTP ${delete_code} for ${item_id}." >&2
+              exit 1
+            fi
+          done
+
+          count="$(jq 'length' calendar/plans.json)"
+          for ((i=0; i<count; i++)); do
+            jq -c ".[$i]" calendar/plans.json > payload.json
+            title="$(jq -r '.title' payload.json)"
+            create_key="auto-learning:create:${plan_date}:${i}:${GITHUB_SHA}"
+
+            create_code="$(curl --silent --show-error \
+              --output create-response.json \
+              --write-out '%{http_code}' \
+              --request POST \
+              "${api}/items" \
+              --header "Authorization: Bearer ${PLAN_AGENT_TOKEN}" \
+              --header 'Content-Type: application/json' \
+              --header "Idempotency-Key: ${create_key}" \
+              --data-binary @payload.json)"
+
+            cat create-response.json
+            echo
+            if [ "$create_code" -lt 200 ] || [ "$create_code" -ge 300 ]; then
+              echo "Calendar create API returned HTTP ${create_code} for ${title}." >&2
+              exit 1
+            fi
+            echo "Published: ${title}"
+          done

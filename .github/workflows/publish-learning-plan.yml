@@ -1,0 +1,67 @@
+name: Publish Learning Plan
+
+on:
+  push:
+    paths:
+      - 'calendar/plan.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-learning-plan-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate plan payload
+        run: |
+          set -euo pipefail
+          jq -e '
+            .title and
+            (.kind == "all_day") and
+            (.start | type == "string") and
+            (.end | type == "string") and
+            (.public == false) and
+            (.done == false) and
+            (.reminder == null) and
+            (.rule == null)
+          ' calendar/plan.json >/dev/null
+
+      - name: Publish to plan.crasnec.com
+        env:
+          PLAN_AGENT_TOKEN: ${{ secrets.PLAN_AGENT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PLAN_AGENT_TOKEN:-}" ]; then
+            echo "PLAN_AGENT_TOKEN secret is not configured." >&2
+            exit 1
+          fi
+
+          plan_date="$(jq -r '.start' calendar/plan.json)"
+          idempotency_key="auto-learning:${plan_date}:${GITHUB_SHA}"
+
+          http_code="$(curl --silent --show-error \
+            --output response.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            'https://plan.crasnec.com/api/agent/v1/items' \
+            --header "Authorization: Bearer ${PLAN_AGENT_TOKEN}" \
+            --header 'Content-Type: application/json' \
+            --header "Idempotency-Key: ${idempotency_key}" \
+            --data-binary @calendar/plan.json)"
+
+          cat response.json
+          echo
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Calendar API returned HTTP ${http_code}." >&2
+            exit 1
+          fi

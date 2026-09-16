@@ -35,8 +35,8 @@ jobs:
               (.kind == "all_day") and
               (.start | type == "string") and
               (.end | type == "string") and
-              (.public == false) and
-              (.done == false) and
+              (.public == true) and
+              (.done | type == "boolean") and
               (.reminder == null) and
               (.rule == null)
             )
